@@ -22,8 +22,8 @@ Ele conversa com as sessões do Ravi pelo gateway HTTP local + Swift SDK.
 
 ## Estado atual
 
-- **Fase 1** (agente Mac + GPT-Live + hotkey + overlay) — entregue 2026-10-18.
-- **Fase 2** (contexto de sessões do Ravi + tools via gateway/SDK) — entregue 2026-10-18.
+- **App + voz** (hotkey, GPT-Live, overlay, idle, memória) — entregue 2026-10-18.
+- **Integração Ravi** (gateway, contexto de sessões, tools `ravi_*`) — entregue 2026-10-18.
 - **Ponte `ravi.voice`** — app `voice` + trigger shell `ravi-voice-inbox` (id `d9e9d1aa`) em
   `ravi.voice.>`; agentes respondem por `ravi voice say --execute --reply-to <id>`.
 - **Memória entre conversas** — `ConversationMemory.swift` + `memory.json`; investigação pedida

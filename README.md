@@ -54,7 +54,7 @@ AudioIO (AVAudioEngine + voice processing/AEC) ◀──▶ LiveSession ◀─�
   mic → PCM16 24kHz, 100ms chunks                    │  session.start / input_audio.append / output_audio.delta
   speaker ← PCM16 24kHz                              │  response.event (delegação Responses → function_call)
                                                      ▼
-                                     ToolRegistry (current_time; fase 2: Ravi)
+                                     ToolRegistry (current_time, close_session, ravi_*)
 ```
 
 - `Sources/RaviVoice/LiveSession.swift` — protocolo GPT-Live, ciclo de vida, loop de tools.
@@ -75,7 +75,7 @@ conversa anterior terminou. Nada fica gravado na OpenAI (o fork de sessão exigi
 e herdaria as instruções antigas). No primeiro boot com memória, o histórico é importado do
 `transcripts.log`. Menu › "Esquecer conversas anteriores" apaga.
 
-## Ravi (fase 2)
+## Ravi
 
 O agente fala com o daemon do Ravi pelo gateway HTTP local, usando o Swift SDK gerado
 (`../ravi.bot/packages/ravi-os-swift-sdk`, dependência local do pacote).
