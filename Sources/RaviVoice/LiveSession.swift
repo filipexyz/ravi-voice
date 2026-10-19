@@ -51,11 +51,18 @@ final class LiveSession {
 
     /// Shadow collector: D0 + provedor externo. Nunca fecha em shadow.
     private let turnEnd: TurnEndService?
+    private let gate: TurnEndGate
     private var turnEndTimer: Timer?
     private var lastOutputSpeechAt: TimeInterval = 0
     private var lastInputSpeechAt: TimeInterval = 0
+    /// Último delta de transcrição; o candidato espera o texto assentar para não mandar snippet cortado.
+    private var lastTranscriptAt: TimeInterval = 0
     private var candidateArmed = false
     private var turnCounter = 0
+    /// Reavaliação após um close adiado pelo gate (não cancela de vez).
+    private var recheckWork: DispatchWorkItem?
+    private var recheckUntil: TimeInterval = 0
+    private var nextCandidateAllowedAt: TimeInterval = 0
     private var recentUtterances: [Utterance] = []
 
     /// Mic chunks are produced on the audio thread; this gate is read there.
@@ -80,6 +87,7 @@ final class LiveSession {
         self.memory = memory
         self.history = history
         self.turnEnd = turnEnd
+        self.gate = TurnEndGate(config: config.turnEnd.d0)
         self.voiceContext = voiceContext
         self.backendContext = backendContext
         self.openingCommentary = openingCommentary
@@ -368,6 +376,7 @@ final class LiveSession {
 
     private func appendTranscript(_ role: Utterance.Role, _ delta: String, now: TimeInterval) {
         transcript.append(role, delta, now: now)
+        lastTranscriptAt = now
         if let line = transcript.currentText(role) { activity?.setCaption(line, isUser: role == .user) }
     }
 
@@ -377,15 +386,16 @@ final class LiveSession {
             memory?.append(utterance)
             recentUtterances.append(utterance)
             if recentUtterances.count > 8 { recentUtterances.removeFirst(recentUtterances.count - 8) }
+            // Só conta fala transcrita como fala do usuário; o nível do mic também
+            // capta eco do próprio agente e não serve para a análise de sombra.
+            if utterance.role == .user {
+                turnEnd?.noteUserSpeech(sessionId: sessionId ?? "unknown", at: utterance.at)
+            }
         }
     }
 
     private func noteInputLevel(_ level: Double, at now: TimeInterval) {
         guard level > config.turnEnd.d0.inputThreshold else { return }
-        // One log line per burst of user speech, not per 100 ms chunk.
-        if now - lastInputSpeechAt >= 1.0 {
-            turnEnd?.noteUserSpeech(sessionId: sessionId ?? "unknown", at: Date())
-        }
         lastInputSpeechAt = now
         // Barge-in cancela o candidato pendente.
         candidateArmed = false
@@ -402,6 +412,10 @@ final class LiveSession {
 
     private func startTurnEndTimer() {
         turnEndTimer?.invalidate()
+        recheckWork?.cancel()
+        recheckWork = nil
+        recheckUntil = 0
+        nextCandidateAllowedAt = 0
         guard turnEnd != nil else { return }
         turnEndTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.tickTurnEnd() }
@@ -412,7 +426,43 @@ final class LiveSession {
     private func tickTurnEnd() {
         guard state == .live, let turnEnd, candidateArmed else { return }
         let now = Self.now
-        let signals = TurnSignals(
+        // 200 ms sem novo delta: evita mandar "Chegou mensagem do Je" no lugar da fala inteira.
+        guard now - lastTranscriptAt >= 0.2 else { return }
+        let signals = currentTurnSignals(now: now)
+        guard turnEnd.isCandidate(signals) else { return }
+        candidateArmed = false
+        recheckWork?.cancel()
+        recheckUntil = 0
+        nextCandidateAllowedAt = now + Double(config.turnEnd.minIntervalMs) / 1000
+        turnCounter += 1
+        let snippets = currentSnippets()
+        let session = sessionId ?? "unknown"
+        let turn = "turn_\(turnCounter)"
+        let onClose: @MainActor () -> Bool = { [weak self] in
+            guard let self, self.state == .live else { return false }
+            let current = self.currentTurnSignals(now: Self.now)
+            if let failure = self.gate.failure(current) {
+                // Não cancela de vez: agenda uma reavaliação para quando o áudio/mic ficar quieto.
+                Log.info("turn-end: fechamento adiado (\(failure)); reavaliar quando o gate liberar")
+                self.scheduleTurnEndRecheck()
+                return false
+            }
+            self.close(reason: "jev")
+            return true
+        }
+        Task {
+            await turnEnd.evaluate(
+                sessionId: session,
+                turnId: turn,
+                signals: signals,
+                snippets: snippets,
+                onClose: onClose
+            )
+        }
+    }
+
+    private func currentTurnSignals(now: TimeInterval) -> TurnSignals {
+        TurnSignals(
             outputLevel: activity?.outputLevel ?? 0,
             inputLevel: activity?.inputLevel ?? 0,
             msSinceAgentSpeech: Int(max(0, now - lastOutputSpeechAt) * 1000),
@@ -421,12 +471,34 @@ final class LiveSession {
             pendingWork: !idle.pendingWork.isEmpty,
             closeRequested: false
         )
-        guard turnEnd.isCandidate(signals) else { return }
-        candidateArmed = false
-        turnCounter += 1
-        let snippets = currentSnippets()
-        let session = sessionId ?? "unknown"
-        Task { await turnEnd.evaluate(sessionId: session, turnId: "turn_\(turnCounter)", signals: signals, snippets: snippets) }
+    }
+
+    /// Se o close foi adiado, tenta de novo em fatias curtas até o gate liberar (máx. 5 s).
+    private func scheduleTurnEndRecheck() {
+        recheckWork?.cancel()
+        let now = Self.now
+        if recheckUntil == 0 { recheckUntil = now + 5.0 }
+        let waitForInterval = max(0, nextCandidateAllowedAt - now)
+        let delay = min(0.4, max(0.1, waitForInterval))
+        let work = DispatchWorkItem { [weak self] in
+            Task { @MainActor in
+                guard let self, self.state == .live else { return }
+                let now = Self.now
+                let current = self.currentTurnSignals(now: now)
+                if self.gate.failure(current) == nil {
+                    self.recheckUntil = 0
+                    self.candidateArmed = true
+                    Log.info("turn-end: gate liberou; reavaliando o fechamento")
+                } else if now < self.recheckUntil {
+                    self.scheduleTurnEndRecheck()
+                } else {
+                    self.recheckUntil = 0
+                    Log.info("turn-end: reavaliação expirou; segue para o idle")
+                }
+            }
+        }
+        recheckWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
     }
 
     private func currentSnippets() -> TurnSnippets {
@@ -466,9 +538,12 @@ final class LiveSession {
         idleTimer?.invalidate()
         closeTimeout?.invalidate()
         turnEndTimer?.invalidate()
+        recheckWork?.cancel()
         idleTimer = nil
         closeTimeout = nil
         turnEndTimer = nil
+        recheckWork = nil
+        recheckUntil = 0
         audioGate.isOpen = false
         audio.onCapture = nil
         audio.flushPlayback()

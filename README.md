@@ -113,6 +113,24 @@ app no Mac: conversa aberta → fala na hora; fechada → acorda (som), fala e f
   `RaviVoice say` espaça as publicações em 1,2s pra nenhuma cair nele.
 - Instalar/remover o lado do Ravi (app + trigger): `scripts/ravi-setup.sh` / `scripts/ravi-setup.sh remove`.
 
+### Fim de turno — D0 + Jev (nativo)
+
+O app calcula um gate acústico local (**D0**: nível de saída baixo por 300 ms, sem fala do
+usuário, sem trabalho pendente) e só então chama o **Jev direto** (`JevTurnEndProvider.swift`),
+sem sidecar. O Jev devolve o estado da conversa e a política decide `close | wait | cancel`.
+Sem chave de API do provider escolhido, o caminho é desativado e o app não fecha por Jev.
+
+- Providers: `vercel` (AI Gateway, `AI_GATEWAY_API_KEY`, `typesafe-ai/jev`) ou `typesafe`
+  (API direta, `TYPESAFE_API_KEY`, `jev-1.13.0`). `model`, `baseURL` e `apiKeyEnv` são
+  configuráveis no bloco `turnEnd`.
+- Chave: `~/.config/ravi-voice/jev.env` (0600), ambiente, ou `~/.ravi/.env`.
+- `shadow=true` só registra; `shadow=false` + `allowLiveClose=true` fecha quando o motivo está
+  em `liveReasonCodes`. Erro/timeout/baixa confiança → `wait`.
+- Logs: `turn-end.jsonl`; relatório: `bun run turn-end/report.ts`.
+- O sidecar `turn-end/server.ts` e o LaunchAgent `bot.ravi.voice.jev` são legados.
+
+Detalhes, replay e limites: `turn-end/README.md`.
+
 ### Context key
 
 O gateway exige uma key `rctx_*`. A do Ravi Voice é uma filha da admin key, só com o necessário:

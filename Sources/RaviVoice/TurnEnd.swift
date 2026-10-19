@@ -29,10 +29,23 @@ struct TurnPolicy: Codable {
 struct TurnEndConfig: Codable {
     /// Liga o coletor. Em shadow ele só observa; nunca fecha.
     var enabled: Bool = true
-    /// Shadow é o padrão. `allowLiveClose` é uma segunda trava: sem ela, nunca age.
-    var shadow: Bool = true
-    var allowLiveClose: Bool = false
-    var url: String = "http://127.0.0.1:8791/v1/turn-end"
+    /// `false` por padrão: a função é nativa e ativa. Use `true` para só observar.
+    var shadow: Bool = false
+    var allowLiveClose: Bool = true
+    /// Teste ativo com prazo. Formato ISO-8601 UTC. `nil` = sem prazo.
+    var liveUntil: String? = nil
+    /// Só estes motivos podem fechar no modo live. WAITING_ASYNC é o mais arriscado.
+    var liveReasonCodes: [String] = ["EXPLICIT_CLOSE", "STATE_ENDED", "WAITING_ASYNC"]
+    /// `vercel` (AI Gateway) ou `typesafe`/`jev` (API direta do Jev).
+    var provider: String = "vercel"
+    /// Sobrescreve o modelo padrão do provider.
+    var model: String? = nil
+    /// Sobrescreve a base URL padrão do provider.
+    var baseURL: String? = nil
+    /// Nome da env var da chave. Padrão: AI_GATEWAY_API_KEY (vercel) / TYPESAFE_API_KEY (typesafe).
+    var apiKeyEnv: String? = nil
+    /// Chave inline (não recomendado; prefira jev.env ou ambiente).
+    var apiKey: String? = nil
     /// O Jev pode passar de 800 ms em partida fria; 1,5 s ainda é fail-safe.
     var timeoutMs: Int = 1500
     /// Não manda mais de um candidato por sessão nesse intervalo.
@@ -206,6 +219,22 @@ struct D0Detector {
     }
 }
 
+/// Diz qual condição do D0 está bloqueando o fechamento. Usado no retry pós-barge-in.
+struct TurnEndGate {
+    let config: D0Config
+
+    func failure(_ s: TurnSignals) -> String? {
+        if s.outputLevel >= config.outputThreshold { return "output_level" }
+        if s.inputLevel >= config.inputThreshold { return "input_level" }
+        if s.msSinceAgentSpeech < config.eosQuietMs { return "eos_quiet" }
+        if s.msSinceUserSpeech < config.userGuardMs { return "user_guard" }
+        if s.pendingWork { return "pending_work" }
+        return nil
+    }
+
+    func isOpen(_ s: TurnSignals) -> Bool { failure(s) == nil }
+}
+
 // MARK: - Política
 
 struct TurnEndPolicyEngine {
@@ -232,57 +261,33 @@ struct TurnEndPolicyEngine {
         }
         return .wait
     }
-}
 
-// MARK: - Provedor HTTP
+    /// Motivo estável para o log e para a allowlist do modo live.
+    func reasonCode(for response: TurnEndResponse, signals: TurnSignals, action: TurnEndAction) -> String {
+        let state = response.state
+        let pode = response.podeProb ?? 0
+        let complete = response.completeProb ?? 0
+        let explicit = response.explicitProb ?? 0
 
-enum TurnEndProviderError: LocalizedError {
-    case badURL
-    case badStatus(Int)
-    case decode(String)
-
-    var errorDescription: String? {
-        switch self {
-        case .badURL: return "URL do provedor inválida"
-        case .badStatus(let code): return "provedor respondeu \(code)"
-        case .decode(let message): return "resposta inválida: \(message)"
+        if action == .close {
+            if state != .continua, explicit >= config.explicitProb, complete >= config.minCompleteProb {
+                return "EXPLICIT_CLOSE"
+            }
+            if state == .encerrada { return "STATE_ENDED" }
+            if state == .aguardando { return "WAITING_ASYNC" }
+            return "CLOSE"
         }
+        guard let state else { return "NO_STATE" }
+        if state != .continua, complete < config.minCompleteProb { return "INCOMPLETE_SPEECH" }
+        if state != .continua, pode < config.minStateProb { return "LOW_CONFIDENCE" }
+        if state == .continua, explicit >= config.explicitProb { return "AGENT_NOT_CLOSING" }
+        return "STATE_CONTINUES"
     }
 }
 
-final class HTTPTurnEndProvider {
-    private let url: URL
-    private let timeout: TimeInterval
+// MARK: - Provedor nativo
 
-    init(config: TurnEndConfig) throws {
-        guard let url = URL(string: config.url) else { throw TurnEndProviderError.badURL }
-        self.url = url
-        self.timeout = TimeInterval(config.timeoutMs) / 1000
-    }
-
-    func evaluate(_ request: TurnEndRequest) async throws -> TurnEndResponse {
-        var req = URLRequest(url: url)
-        req.httpMethod = "POST"
-        req.timeoutInterval = timeout
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.setValue("\(request.sessionId)/\(request.candidateId)", forHTTPHeaderField: "Idempotency-Key")
-        let encoder = JSONEncoder()
-        req.httpBody = try encoder.encode(request)
-
-        let (data, response) = try await URLSession.shared.data(for: req)
-        guard let http = response as? HTTPURLResponse else {
-            throw TurnEndProviderError.badStatus(-1)
-        }
-        guard (200..<300).contains(http.statusCode) else {
-            throw TurnEndProviderError.badStatus(http.statusCode)
-        }
-        do {
-            return try JSONDecoder().decode(TurnEndResponse.self, from: data)
-        } catch {
-            throw TurnEndProviderError.decode(error.localizedDescription)
-        }
-    }
-}
+// A chamada nativa ao Jev fica em JevTurnEndProvider.swift.
 
 // MARK: - Janela de sombra
 
@@ -298,7 +303,7 @@ struct ShadowWindow: Codable {
 @MainActor
 final class TurnEndService {
     private let config: TurnEndConfig
-    private let provider: HTTPTurnEndProvider?
+    private let provider: JevTurnEndProvider?
     private let d0: D0Detector
     private let policy: TurnEndPolicyEngine
     private let shadowURL: URL
@@ -317,22 +322,41 @@ final class TurnEndService {
 
     init(config: TurnEndConfig) {
         self.config = config
-        self.provider = try? HTTPTurnEndProvider(config: config)
+        self.provider = JevTurnEndProvider(config: config)
         self.d0 = D0Detector(config: config.d0)
         self.policy = TurnEndPolicyEngine(config: config.policy)
         self.shadowURL = Config.directory.appendingPathComponent("turn-end-shadow.json")
         self.shadow = Self.loadOrStartShadow(config: config, url: shadowURL)
 
-        if config.enabled {
-            Log.info("turn-end: shadow ativo até \(Self.iso.string(from: shadow.endsAt)) (janela \(Int(config.shadowHours))h)")
-            if provider == nil { Log.error("turn-end: provedor HTTP inválido; tudo vira wait") }
+        if config.enabled, provider != nil {
+            if isLiveActive {
+                let until = liveUntilDate.map { Self.iso.string(from: $0) } ?? "sem prazo"
+                Log.info("turn-end: LIVE nativo até \(until); provider=\(config.provider) model=\(provider?.resolved.model ?? "?")")
+            } else {
+                Log.info("turn-end: shadow ativo até \(Self.iso.string(from: shadow.endsAt)) (janela \(Int(config.shadowHours))h)")
+            }
+        } else if config.enabled {
+            Log.info("turn-end: desativado (sem chave Jev para o provider \(config.provider))")
         } else {
             Log.info("turn-end: desligado na config")
         }
     }
 
+    private var liveUntilDate: Date? {
+        guard let raw = config.liveUntil else { return nil }
+        return ISO8601DateFormatter().date(from: raw)
+    }
+
+    /// Live exige três coisas: shadow=false, allowLiveClose=true e prazo não vencido.
+    var isLiveActive: Bool {
+        guard config.enabled, provider != nil, !config.shadow, config.allowLiveClose else { return false }
+        guard let until = liveUntilDate else { return true }
+        return Date() < until
+    }
+
+    /// Coleta (shadow ou live) enquanto a janela estiver aberta.
     var isShadowActive: Bool {
-        guard config.enabled, shadow.active else { return false }
+        guard config.enabled, provider != nil, shadow.active else { return false }
         return Date() < shadow.endsAt
     }
 
@@ -353,7 +377,8 @@ final class TurnEndService {
         sessionId: String,
         turnId: String,
         signals: TurnSignals,
-        snippets: TurnSnippets
+        snippets: TurnSnippets,
+        onClose: (@MainActor () -> Bool)? = nil
     ) async -> TurnEndResponse? {
         guard isShadowActive else { return nil }
         let now = Date()
@@ -363,7 +388,7 @@ final class TurnEndService {
 
         counter += 1
         let candidateId = "\(sessionId)-c\(counter)"
-        let mode = (config.shadow || !config.allowLiveClose) ? "shadow" : "live"
+        let mode = isLiveActive ? "live" : "shadow"
         let request = TurnEndRequest(
             requestId: UUID().uuidString,
             sessionId: sessionId,
@@ -381,7 +406,7 @@ final class TurnEndService {
         lastCandidateSession = sessionId
 
         let started = Date()
-        let response: TurnEndResponse
+        var response: TurnEndResponse
         if let provider {
             do {
                 response = try await provider.evaluate(request)
@@ -408,8 +433,17 @@ final class TurnEndService {
         }
 
         let appDecision = policy.decide(response, signals: signals)
-        // Trava dura: em shadow, ou sem allowLiveClose, nunca fecha por este caminho.
-        let acted = (mode == "live" && config.allowLiveClose && appDecision == .close)
+        let providerDecision = response.decision
+        let derivedReason = policy.reasonCode(for: response, signals: signals, action: appDecision)
+        if response.reasonCode == nil || response.reasonCode == "UNKNOWN" {
+            response.reasonCode = derivedReason
+        }
+        response.decision = appDecision.rawValue
+        let reasonAllowed = config.liveReasonCodes.contains(response.reasonCode ?? "")
+        // Live exige modo live, interlock, decisão close e motivo na allowlist.
+        let wouldAct = (mode == "live" && config.allowLiveClose && appDecision == .close && reasonAllowed)
+        // O callback recheca o gate de entrada; se o usuário voltou a falar, não fecha.
+        let acted = wouldAct ? (onClose?() ?? false) : false
         writeLog([
             "type": "candidate",
             "at": Self.iso.string(from: now),
@@ -420,8 +454,11 @@ final class TurnEndService {
             "d0": true,
             "signals": encode(signals),
             "snippets": encode(snippets),
+            "provider_decision": providerDecision,
             "decision": response.decision,
             "app_decision": appDecision.rawValue,
+            "would_act": wouldAct,
+            "reason_allowed": reasonAllowed,
             "state": response.state?.rawValue ?? NSNull(),
             "state_prob": response.stateProb ?? NSNull(),
             "pode_prob": response.podeProb ?? NSNull(),

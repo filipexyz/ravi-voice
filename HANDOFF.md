@@ -32,6 +32,19 @@ Ele conversa com as sessões do Ravi pelo gateway HTTP local + Swift SDK.
 - **PR aberto no ravi.bot**: `filipexyz/ravi#701` — "feat(triggers): optional cooldown and
   debounce, so bursts are batched instead of dropped". Push com `--no-verify` autorizado;
   Quality Gate (suíte inteira) estava rodando no fechamento deste handoff.
+- **Fim de turno (nativo, live)** — 2026-10-19: `JevTurnEndProvider.swift` chama o Jev
+  **direto do app**, sem sidecar. D0 local + política em `TurnEnd.swift`; retry pós-gate em
+  `LiveSession.swift`. Provider/model/base/chave configuráveis no bloco `turnEnd`:
+  `provider` (`vercel` ou `typesafe`/`jev`), `model`, `baseURL`, `apiKeyEnv`; sem chave o
+  provider não é criado e o app não fecha por Jev. Chave em
+  `~/.config/ravi-voice/jev.env` (0600). O sidecar `turn-end/server.ts` e o LaunchAgent
+  `bot.ravi.voice.jev` ficaram **legados**; o app não os consulta mais. App reinstalado às
+  03:25Z; log: `turn-end: LIVE nativo até sem prazo; provider=vercel model=typesafe-ai/jev`.
+  Retry: gate bloqueado não cancela de vez; reavalia a cada ~400 ms por até 5 s, espera 200 ms
+  de transcrição estável e então manda novo candidato. Motivo do gate é logado. 43 testes
+  passavam antes desta mudança; depois dela rodei só `swift build`/install, sem suíte.
+  Relatório: `bun run turn-end/report.ts`. Replay de 111: D0 sozinho 19/33 cortes; D0+Jev
+  1/33 em 2 s e 4/33 em 3,5 s. Cron `c3144a6c` reporta no fim da janela de shadow.
 
 ## Mudanças pendentes de build/install (código pronto, não buildado)
 
