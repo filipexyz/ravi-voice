@@ -122,6 +122,17 @@ struct Config: Codable {
         return config
     }
 
+    /// Updates only `inputDevice` in the on-disk config, preserving all other fields.
+    static func persistInputDevice(_ name: String?) {
+        guard let data = try? Data(contentsOf: fileURL),
+              var object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+        if let name { object["inputDevice"] = name } else { object.removeValue(forKey: "inputDevice") }
+        guard let saved = try? JSONSerialization.data(withJSONObject: object,
+                                                      options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])
+        else { return }
+        try? saved.write(to: fileURL)
+    }
+
     /// API key resolution: config → environment → ~/.ravi/.env (the daemon's env file).
     func resolveApiKey() -> String? {
         if let key = openaiApiKey, !key.isEmpty { return key }

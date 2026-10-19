@@ -1,8 +1,9 @@
 import AppKit
+import CoreAudio
 
 /// Menu bar agent: owns the hotkey, the audio engine and the current live session.
 @MainActor
-final class AppController: NSObject, NSApplicationDelegate {
+final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var config = Config.load()
     private let audio = AudioIO()
     private let tools = ToolRegistry([CurrentTimeTool()])
@@ -24,6 +25,8 @@ final class AppController: NSObject, NSApplicationDelegate {
     private let statusLine = NSMenuItem(title: "", action: nil, keyEquivalent: "")
     private let toggleItem = NSMenuItem(title: "", action: #selector(toggleSession), keyEquivalent: "")
     private let muteItem = NSMenuItem(title: "Mutar microfone", action: #selector(toggleMute), keyEquivalent: "")
+    private let micItem = NSMenuItem(title: "Microfone", action: nil, keyEquivalent: "")
+    private let micMenu = NSMenu()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
@@ -35,6 +38,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         tools.register(CloseSessionTool { [weak self] in self?.session?.close(reason: "user_request") })
         inbox = VoiceInbox { [weak self] message in self?.handleInbox(message) }
         inbox?.start()
+        registerMicChangeListener()
         Log.info("Ravi Voice pronto; hotkey \(config.hotkey), idle \(Int(config.idleTimeoutSeconds))s")
         if CommandLine.arguments.contains("--start") { startSession() }
     }
@@ -198,6 +202,52 @@ final class AppController: NSObject, NSApplicationDelegate {
         NSSound(named: NSSound.Name(name))?.play()
     }
 
+    // MARK: Mic
+
+    /// Listens for Core Audio device-list changes (plug/unplug) and refreshes the submenu.
+    private func registerMicChangeListener() {
+        var addr = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDevices,
+                                              mScope: kAudioObjectPropertyScopeGlobal,
+                                              mElement: kAudioObjectPropertyElementMain)
+        AudioObjectAddPropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &addr, .main) { [weak self] _, _ in
+            self?.rebuildMicMenu()
+        }
+    }
+
+    /// NSMenuDelegate — rebuild list every time the submenu opens (catches late changes).
+    func menuWillOpen(_ menu: NSMenu) {
+        guard menu === micMenu else { return }
+        rebuildMicMenu()
+    }
+
+    private func rebuildMicMenu() {
+        micMenu.removeAllItems()
+        let defaultItem = NSMenuItem(title: "Padrão do sistema", action: #selector(selectMic(_:)), keyEquivalent: "")
+        defaultItem.representedObject = nil as String?
+        defaultItem.target = self
+        defaultItem.state = config.inputDevice == nil ? .on : .off
+        micMenu.addItem(defaultItem)
+        let devices = AudioIO.availableInputDevices()
+        if !devices.isEmpty { micMenu.addItem(.separator()) }
+        for name in devices {
+            let it = NSMenuItem(title: name, action: #selector(selectMic(_:)), keyEquivalent: "")
+            it.representedObject = name
+            it.target = self
+            it.state = config.inputDevice == name ? .on : .off
+            micMenu.addItem(it)
+        }
+        micItem.title = config.inputDevice.map { "Microfone: \($0)" } ?? "Microfone"
+    }
+
+    @objc private func selectMic(_ sender: NSMenuItem) {
+        let name = sender.representedObject as? String
+        config.inputDevice = name
+        Config.persistInputDevice(name)
+        audio.inputDevice = name
+        rebuildMicMenu()
+        Log.info("microfone: \(name ?? "padrão do sistema")")
+    }
+
     // MARK: Menu
 
     private func buildMenu() {
@@ -209,6 +259,9 @@ final class AppController: NSObject, NSApplicationDelegate {
         muteItem.target = self
         menu.addItem(toggleItem)
         menu.addItem(muteItem)
+        micItem.submenu = micMenu
+        micMenu.delegate = self
+        menu.addItem(micItem)
         menu.addItem(.separator())
         menu.addItem(item("Abrir config", #selector(openConfig)))
         menu.addItem(item("Recarregar config", #selector(reloadConfig)))

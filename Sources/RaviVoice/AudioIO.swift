@@ -90,45 +90,50 @@ final class AudioIO {
         Log.info("áudio parado")
     }
 
-    /// Selects a specific input device by name on the engine's input audio unit.
-    /// Falls back to the system default if the device is not found or the call fails.
     private func applyInputDevice(_ name: String, to inputNode: AVAudioInputNode) {
-        var propAddr = AudioObjectPropertyAddress(
-            mSelector: kAudioHardwarePropertyDevices,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain
-        )
-        var size: UInt32 = 0
-        guard AudioObjectGetPropertyDataSize(AudioObjectID(kAudioObjectSystemObject), &propAddr, 0, nil, &size) == noErr else { return }
-        let count = Int(size) / MemoryLayout<AudioDeviceID>.size
-        var devices = [AudioDeviceID](repeating: kAudioObjectUnknown, count: count)
-        guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &propAddr, 0, nil, &size, &devices) == noErr else { return }
-
-        var nameAddr = AudioObjectPropertyAddress(
-            mSelector: kAudioObjectPropertyName,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain
-        )
-        for deviceID in devices {
-            var nameRef: Unmanaged<CFString>?
-            var nameSize = UInt32(MemoryLayout<CFString>.size)
-            guard AudioObjectGetPropertyData(deviceID, &nameAddr, 0, nil, &nameSize, &nameRef) == noErr else { continue }
-            guard let nameRef, (nameRef.takeRetainedValue() as String) == name else { continue }
-            var id = deviceID
-            let status = AudioUnitSetProperty(
-                inputNode.audioUnit!,
-                kAudioOutputUnitProperty_CurrentDevice,
-                kAudioUnitScope_Global, 0,
-                &id, UInt32(MemoryLayout<AudioDeviceID>.size)
-            )
-            if status == noErr {
-                Log.info("microfone selecionado: \(name)")
-            } else {
-                Log.warn("falha ao selecionar microfone '\(name)' (err \(status)); usando padrão do sistema")
-            }
+        guard let id = Self.enumerateAudioDevices().first(where: { $0.name == name })?.id else {
+            Log.warn("microfone '\(name)' não encontrado; usando padrão do sistema")
             return
         }
-        Log.warn("microfone '\(name)' não encontrado; usando padrão do sistema")
+        var devID = id
+        let status = AudioUnitSetProperty(
+            inputNode.audioUnit!,
+            kAudioOutputUnitProperty_CurrentDevice,
+            kAudioUnitScope_Global, 0,
+            &devID, UInt32(MemoryLayout<AudioDeviceID>.size)
+        )
+        if status == noErr { Log.info("microfone selecionado: \(name)") }
+        else { Log.warn("falha ao selecionar microfone '\(name)' (err \(status)); usando padrão do sistema") }
+    }
+
+    /// All audio devices with a name.
+    static func enumerateAudioDevices() -> [(name: String, id: AudioDeviceID)] {
+        var addr = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDevices,
+                                              mScope: kAudioObjectPropertyScopeGlobal,
+                                              mElement: kAudioObjectPropertyElementMain)
+        var size: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size) == noErr, size > 0 else { return [] }
+        var devices = [AudioDeviceID](repeating: kAudioObjectUnknown, count: Int(size) / MemoryLayout<AudioDeviceID>.size)
+        guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size, &devices) == noErr else { return [] }
+        var nameAddr = AudioObjectPropertyAddress(mSelector: kAudioObjectPropertyName,
+                                                  mScope: kAudioObjectPropertyScopeGlobal,
+                                                  mElement: kAudioObjectPropertyElementMain)
+        return devices.compactMap { id in
+            var ref: Unmanaged<CFString>?; var sz = UInt32(MemoryLayout<CFString>.size)
+            guard AudioObjectGetPropertyData(id, &nameAddr, 0, nil, &sz, &ref) == noErr, let ref else { return nil }
+            return (ref.takeRetainedValue() as String, id)
+        }
+    }
+
+    /// Names of devices that have at least one input stream (microphones).
+    static func availableInputDevices() -> [String] {
+        enumerateAudioDevices().filter { pair in
+            var addr = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyStreams,
+                                                  mScope: kAudioObjectPropertyScopeInput,
+                                                  mElement: kAudioObjectPropertyElementMain)
+            var size: UInt32 = 0
+            return AudioObjectGetPropertyDataSize(pair.id, &addr, 0, nil, &size) == noErr && size > 0
+        }.map(\.name)
     }
 
     /// Voice processing itself posts configuration changes while it settles, so only
