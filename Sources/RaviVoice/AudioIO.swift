@@ -1,4 +1,5 @@
 import AVFoundation
+import CoreAudio
 
 /// Full-duplex audio for the live session: mic → PCM16 24 kHz mono chunks, and PCM16 24 kHz
 /// mono from the model → speakers. Voice processing is on so the mic hears the user, not the
@@ -10,6 +11,9 @@ final class AudioIO {
 
     /// Called on the audio thread with exactly `chunkBytes` of PCM16 LE.
     var onCapture: ((Data) -> Void)?
+    /// Input device name as shown in System Settings › Sound › Input.
+    /// nil = macOS system default. Find exact names in Audio MIDI Setup.app.
+    var inputDevice: String?
 
     // Fresh engine per session: re-enabling voice processing on a used engine is unreliable.
     private var engine = AVAudioEngine()
@@ -39,6 +43,7 @@ final class AudioIO {
         _ = engine.outputNode
         _ = engine.mainMixerNode
         let input = engine.inputNode
+        if let name = inputDevice { applyInputDevice(name, to: input) }
         do {
             try input.setVoiceProcessingEnabled(true)
             input.voiceProcessingOtherAudioDuckingConfiguration =
@@ -83,6 +88,47 @@ final class AudioIO {
         pending.removeAll()
         isRunning = false
         Log.info("áudio parado")
+    }
+
+    /// Selects a specific input device by name on the engine's input audio unit.
+    /// Falls back to the system default if the device is not found or the call fails.
+    private func applyInputDevice(_ name: String, to inputNode: AVAudioInputNode) {
+        var propAddr = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDevices,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var size: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(AudioObjectID(kAudioObjectSystemObject), &propAddr, 0, nil, &size) == noErr else { return }
+        let count = Int(size) / MemoryLayout<AudioDeviceID>.size
+        var devices = [AudioDeviceID](repeating: kAudioObjectUnknown, count: count)
+        guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &propAddr, 0, nil, &size, &devices) == noErr else { return }
+
+        var nameAddr = AudioObjectPropertyAddress(
+            mSelector: kAudioObjectPropertyName,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        for deviceID in devices {
+            var nameRef: Unmanaged<CFString>?
+            var nameSize = UInt32(MemoryLayout<CFString>.size)
+            guard AudioObjectGetPropertyData(deviceID, &nameAddr, 0, nil, &nameSize, &nameRef) == noErr else { continue }
+            guard let nameRef, (nameRef.takeRetainedValue() as String) == name else { continue }
+            var id = deviceID
+            let status = AudioUnitSetProperty(
+                inputNode.audioUnit!,
+                kAudioOutputUnitProperty_CurrentDevice,
+                kAudioUnitScope_Global, 0,
+                &id, UInt32(MemoryLayout<AudioDeviceID>.size)
+            )
+            if status == noErr {
+                Log.info("microfone selecionado: \(name)")
+            } else {
+                Log.warn("falha ao selecionar microfone '\(name)' (err \(status)); usando padrão do sistema")
+            }
+            return
+        }
+        Log.warn("microfone '\(name)' não encontrado; usando padrão do sistema")
     }
 
     /// Voice processing itself posts configuration changes while it settles, so only

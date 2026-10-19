@@ -28,6 +28,12 @@ struct Config: Codable {
     var overlay: Bool = true
     /// Optional; otherwise OPENAI_API_KEY from the environment or ~/.ravi/.env.
     var openaiApiKey: String?
+    /// Provedor externo de fim de turno (D0 local + Jev semântico).
+    var turnEnd: TurnEndConfig = TurnEndConfig()
+    /// Input device name as shown in System Settings › Sound › Input (nil = system default).
+    /// Find exact names in Audio MIDI Setup.app or in ~/Library/Logs/RaviVoice/ravi-voice.log
+    /// after a session starts. Example: "MacBook Pro Microphone", "Yeti Stereo Microphone".
+    var inputDevice: String?
 
     /// Ravi integration through the local gateway (see README for the context key).
     var raviEnabled: Bool = true

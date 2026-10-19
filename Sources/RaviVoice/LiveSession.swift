@@ -49,6 +49,15 @@ final class LiveSession {
     private let memory: ConversationMemory?
     private let history: [[String: Any]]
 
+    /// Shadow collector: D0 + provedor externo. Nunca fecha em shadow.
+    private let turnEnd: TurnEndService?
+    private var turnEndTimer: Timer?
+    private var lastOutputSpeechAt: TimeInterval = 0
+    private var lastInputSpeechAt: TimeInterval = 0
+    private var candidateArmed = false
+    private var turnCounter = 0
+    private var recentUtterances: [Utterance] = []
+
     /// Mic chunks are produced on the audio thread; this gate is read there.
     private let audioGate = AudioGate()
 
@@ -65,10 +74,12 @@ final class LiveSession {
     init(config: Config, apiKey: String, tools: ToolRegistry, audio: AudioIO,
          voiceContext: String = "", backendContext: String = "",
          openingCommentary: [String] = [], idleTimeout: TimeInterval? = nil,
-         memory: ConversationMemory? = nil, history: [[String: Any]] = []) {
+         memory: ConversationMemory? = nil, history: [[String: Any]] = [],
+         turnEnd: TurnEndService? = nil) {
         self.config = config
         self.memory = memory
         self.history = history
+        self.turnEnd = turnEnd
         self.voiceContext = voiceContext
         self.backendContext = backendContext
         self.openingCommentary = openingCommentary
@@ -104,6 +115,7 @@ final class LiveSession {
             Task { @MainActor in
                 self?.socket?.send(.string(payload)) { _ in }
                 self?.activity?.setInput(level)
+                if let self { self.noteInputLevel(level, at: Self.now) }
             }
         }
 
@@ -248,7 +260,12 @@ final class LiveSession {
             guard let b64 = event["delta"] as? String, let pcm = Data(base64Encoded: b64) else { return }
             audio.play(pcm16: pcm)
             if AudioIO.peak(pcm16: pcm) > Self.speechPeakThreshold { idle.touch(at: now) }
-            activity?.setOutput(VoiceActivity.level(pcm16: pcm))
+            let level = VoiceActivity.level(pcm16: pcm)
+            activity?.setOutput(level)
+            if level > config.turnEnd.d0.outputThreshold {
+                lastOutputSpeechAt = now
+                candidateArmed = true
+            }
 
         case "session.started":
             let session = event["session"] as? [String: Any]
@@ -257,6 +274,7 @@ final class LiveSession {
             audioGate.isOpen = true
             state = .live
             startIdleTimer()
+            startTurnEndTimer()
             Log.info("sessão ativa \(sessionId ?? "?")")
             openingCommentary.forEach(appendCommentary)
             openingCommentary.removeAll()
@@ -357,7 +375,20 @@ final class LiveSession {
         for utterance in utterances {
             Log.transcript(utterance.role == .user ? "você" : "ravi", utterance.text)
             memory?.append(utterance)
+            recentUtterances.append(utterance)
+            if recentUtterances.count > 8 { recentUtterances.removeFirst(recentUtterances.count - 8) }
         }
+    }
+
+    private func noteInputLevel(_ level: Double, at now: TimeInterval) {
+        guard level > config.turnEnd.d0.inputThreshold else { return }
+        // One log line per burst of user speech, not per 100 ms chunk.
+        if now - lastInputSpeechAt >= 1.0 {
+            turnEnd?.noteUserSpeech(sessionId: sessionId ?? "unknown", at: Date())
+        }
+        lastInputSpeechAt = now
+        // Barge-in cancela o candidato pendente.
+        candidateArmed = false
     }
 
     // MARK: Idle + teardown
@@ -367,6 +398,53 @@ final class LiveSession {
         idleTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.tick() }
         }
+    }
+
+    private func startTurnEndTimer() {
+        turnEndTimer?.invalidate()
+        guard turnEnd != nil else { return }
+        turnEndTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.tickTurnEnd() }
+        }
+    }
+
+    /// 100 ms tick: só chama o provedor quando o D0 confirma o candidato.
+    private func tickTurnEnd() {
+        guard state == .live, let turnEnd, candidateArmed else { return }
+        let now = Self.now
+        let signals = TurnSignals(
+            outputLevel: activity?.outputLevel ?? 0,
+            inputLevel: activity?.inputLevel ?? 0,
+            msSinceAgentSpeech: Int(max(0, now - lastOutputSpeechAt) * 1000),
+            msSinceUserSpeech: Int(max(0, now - lastInputSpeechAt) * 1000),
+            eos: true,
+            pendingWork: !idle.pendingWork.isEmpty,
+            closeRequested: false
+        )
+        guard turnEnd.isCandidate(signals) else { return }
+        candidateArmed = false
+        turnCounter += 1
+        let snippets = currentSnippets()
+        let session = sessionId ?? "unknown"
+        Task { await turnEnd.evaluate(sessionId: session, turnId: "turn_\(turnCounter)", signals: signals, snippets: snippets) }
+    }
+
+    private func currentSnippets() -> TurnSnippets {
+        let lastUser = recentUtterances.last(where: { $0.role == .user })?.text
+        let currentAgent = transcript.currentText(.assistant)
+        let lastAgent = (currentAgent?.isEmpty == false ? currentAgent : recentUtterances.last(where: { $0.role == .assistant })?.text)
+        let recent = recentUtterances.suffix(4).map {
+            TurnSnippet(role: $0.role == .user ? "user" : "assistant", text: Self.truncate($0.text, 500))
+        }
+        return TurnSnippets(
+            lastUser: lastUser.map { Self.truncate($0, 500) },
+            lastAgent: lastAgent.map { Self.truncate($0, 500) },
+            recent: Array(recent)
+        )
+    }
+
+    private static func truncate(_ text: String, _ limit: Int) -> String {
+        text.count > limit ? String(text.prefix(limit)) + "…" : text
     }
 
     private func tick() {
@@ -384,10 +462,13 @@ final class LiveSession {
 
     private func finish(reason: String) {
         guard state != .idle else { return }
+        let endedSession = sessionId ?? "unknown"
         idleTimer?.invalidate()
         closeTimeout?.invalidate()
+        turnEndTimer?.invalidate()
         idleTimer = nil
         closeTimeout = nil
+        turnEndTimer = nil
         audioGate.isOpen = false
         audio.onCapture = nil
         audio.flushPlayback()
@@ -400,6 +481,7 @@ final class LiveSession {
         record(transcript.flushAll())
         activity?.reset()
         state = .idle
+        turnEnd?.noteSessionEnd(sessionId: endedSession, reason: reason)
         onEnded?(reason)
     }
 }

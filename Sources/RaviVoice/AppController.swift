@@ -8,6 +8,7 @@ final class AppController: NSObject, NSApplicationDelegate {
     private let tools = ToolRegistry([CurrentTimeTool()])
     private var ravi: RaviBridge?
     private var session: LiveSession?
+    private var turnEnd: TurnEndService?
     private var hotkey: HotkeyMonitor?
     private var statusItem: NSStatusItem!
     private var lastEndReason: String?
@@ -29,6 +30,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         buildMenu()
         render(.idle)
         installHotkey()
+        turnEnd = TurnEndService(config: config.turnEnd)
         setUpRavi()
         tools.register(CloseSessionTool { [weak self] in self?.session?.close(reason: "user_request") })
         inbox = VoiceInbox { [weak self] message in self?.handleInbox(message) }
@@ -154,6 +156,7 @@ final class AppController: NSObject, NSApplicationDelegate {
     }
 
     private func openSession(apiKey: String) {
+        audio.inputDevice = config.inputDevice
         let history = config.memoryEnabled
             ? memory.historyInput(maxAge: config.memoryHours * 3600, maxTokens: config.memoryMaxTokens)
             : []
@@ -165,7 +168,8 @@ final class AppController: NSObject, NSApplicationDelegate {
             openingCommentary: pendingOpening,
             idleTimeout: pendingIdleTimeout,
             memory: config.memoryEnabled ? memory : nil,
-            history: history
+            history: history,
+            turnEnd: turnEnd
         )
         pendingOpening.removeAll()
         pendingIdleTimeout = nil
@@ -262,6 +266,7 @@ final class AppController: NSObject, NSApplicationDelegate {
 
     @objc private func reloadConfig() {
         config = Config.load()
+        turnEnd = TurnEndService(config: config.turnEnd)
         installHotkey()
         render(session?.state ?? .idle)
         Log.info("config recarregado (vale a partir da próxima sessão)")
