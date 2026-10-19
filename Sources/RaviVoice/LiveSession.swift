@@ -1,0 +1,415 @@
+import Foundation
+
+/// One GPT-Live voice session over WebSocket (wss://api.openai.com/v1/live/sessions).
+///
+/// Lifecycle: `start()` → session.start → session.started → stream mic audio → … →
+/// `close()` (hotkey, idle timeout) → session.close → session.closed → teardown.
+/// Backend work uses Responses delegation; function calls are run by `ToolRegistry`.
+@MainActor
+final class LiveSession {
+    enum State: Equatable {
+        case idle, connecting, live, closing
+    }
+
+    static let endpoint = URL(string: "wss://api.openai.com/v1/live/sessions")!
+    /// Output frames quieter than this count as silence (the model streams silence continuously).
+    static let speechPeakThreshold = 300
+
+    private(set) var state: State = .idle {
+        didSet {
+            guard state != oldValue else { return }
+            activity?.sessionState = state
+            onStateChange?(state)
+        }
+    }
+    /// UI state for the overlay face.
+    var activity: VoiceActivity?
+    private(set) var isMuted = false
+    var onStateChange: ((State) -> Void)?
+    /// Called once per closed session with the reason ("idle", "hotkey", "expired", an error…).
+    var onEnded: ((String) -> Void)?
+
+    private let config: Config
+    private let apiKey: String
+    private let tools: ToolRegistry
+    private let audio: AudioIO
+    private let urlSession = URLSession(configuration: .default)
+
+    private var socket: URLSessionWebSocketTask?
+    private var sessionId: String?
+    private var idle: IdleTracker
+    private var idleTimer: Timer?
+    private var closeTimeout: Timer?
+    private var endReason = "closed"
+
+    /// Function calls emitted per delegation, run once that delegation's response completes.
+    private var pendingCalls: [String: [(callId: String, task: Task<String, Never>)]] = [:]
+    private var transcript = TranscriptAssembler()
+    /// Earlier conversations: sent as `session.input`, and every finished utterance is added.
+    private let memory: ConversationMemory?
+    private let history: [[String: Any]]
+
+    /// Mic chunks are produced on the audio thread; this gate is read there.
+    private let audioGate = AudioGate()
+
+    /// Extra context appended to the voice and backend instructions (Ravi snapshot).
+    private let voiceContext: String
+    private let backendContext: String
+
+    /// Said right after the session starts (a woken session speaks first).
+    private var openingCommentary: [String]
+    private let idleTimeout: TimeInterval
+    /// When set, close as soon as everyone has been quiet this long (after a request went out).
+    private var closeWhenQuietAfter: TimeInterval?
+
+    init(config: Config, apiKey: String, tools: ToolRegistry, audio: AudioIO,
+         voiceContext: String = "", backendContext: String = "",
+         openingCommentary: [String] = [], idleTimeout: TimeInterval? = nil,
+         memory: ConversationMemory? = nil, history: [[String: Any]] = []) {
+        self.config = config
+        self.memory = memory
+        self.history = history
+        self.voiceContext = voiceContext
+        self.backendContext = backendContext
+        self.openingCommentary = openingCommentary
+        self.idleTimeout = idleTimeout ?? config.idleTimeoutSeconds
+        self.apiKey = apiKey
+        self.tools = tools
+        self.audio = audio
+        self.idle = IdleTracker(timeout: idleTimeout ?? config.idleTimeoutSeconds, now: Self.now)
+    }
+
+    private static var now: TimeInterval { ProcessInfo.processInfo.systemUptime }
+
+    // MARK: Control
+
+    func start() {
+        guard state == .idle else { return }
+        state = .connecting
+        endReason = "closed"
+        isMuted = false
+
+        do {
+            try audio.start()
+        } catch {
+            Log.error("não consegui abrir o áudio: \(error)")
+            finish(reason: "audio_error")
+            return
+        }
+        let gate = audioGate
+        audio.onCapture = { [weak self] chunk in
+            guard gate.isOpen else { return }
+            let payload = #"{"type":"session.input_audio.append","audio":"\#(chunk.base64EncodedString())"}"#
+            let level = VoiceActivity.level(pcm16: chunk)
+            Task { @MainActor in
+                self?.socket?.send(.string(payload)) { _ in }
+                self?.activity?.setInput(level)
+            }
+        }
+
+        var request = URLRequest(url: Self.endpoint)
+        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        let socket = urlSession.webSocketTask(with: request)
+        socket.maximumMessageSize = 16 * 1024 * 1024
+        self.socket = socket
+        socket.resume()
+        receive(on: socket)
+        send(sessionStartEvent())
+        Log.info("conectando ao \(config.model)…")
+    }
+
+    /// Graceful close: session.close, then wait for session.closed (or time out).
+    func close(reason: String) {
+        switch state {
+        case .idle, .closing: return
+        case .connecting:
+            endReason = reason
+            finish(reason: reason)
+        case .live:
+            endReason = reason
+            state = .closing
+            audioGate.isOpen = false
+            send(["type": "session.close", "event_id": "close_\(reason)"])
+            closeTimeout = Timer.scheduledTimer(withTimeInterval: 6, repeats: false) { [weak self] _ in
+                Task { @MainActor in
+                    Log.warn("session.closed não chegou; finalização de uso não confirmada")
+                    self?.finish(reason: reason)
+                }
+            }
+        }
+    }
+
+    func setMuted(_ muted: Bool) {
+        guard state == .live, muted != isMuted else { return }
+        isMuted = muted
+        activity?.muted = muted
+        send(["type": muted ? "session.input_audio.mute" : "session.input_audio.unmute", "event_id": muted ? "mute" : "unmute"])
+        idle.touch(at: Self.now)
+    }
+
+    /// Context the model should say aloud soon (e.g. an async notification in phase 2).
+    func appendCommentary(_ content: String) {
+        guard state == .live else { return }
+        send(["type": "session.commentary.append", "delegation_id": NSNull(), "content": content])
+    }
+
+    /// Say something now (a Ravi reply or message). Queued if the session is still connecting.
+    /// Returns false when there is no session to say it.
+    func announce(_ text: String) -> Bool {
+        switch state {
+        case .live:
+            appendCommentary(text)
+            closeWhenQuietAfter = nil
+            idle.touch(at: Self.now)
+            return true
+        case .connecting:
+            openingCommentary.append(text)
+            return true
+        case .idle, .closing:
+            return false
+        }
+    }
+
+    /// End the conversation once both sides have been quiet for `seconds` (used after a request
+    /// is sent: the voice says "I'll get back to you" and hangs up; the answer reopens it).
+    func closeWhenQuiet(after seconds: TimeInterval) {
+        guard state == .live else { return }
+        closeWhenQuietAfter = seconds
+    }
+
+    // MARK: Wire
+
+    private func sessionStartEvent() -> [String: Any] {
+        var backendTools = tools.definitions
+        if config.webSearch { backendTools.append(["type": "web_search"]) }
+        var responses: [String: Any] = [
+            "model": config.backendModel,
+            "instructions": [config.backendInstructions, backendContext].filter { !$0.isEmpty }.joined(separator: "\n\n"),
+            "tool_choice": "auto",
+        ]
+        if !backendTools.isEmpty { responses["tools"] = backendTools }
+        return [
+            "type": "session.start",
+            "event_id": "start",
+            "session": [
+                "model": config.model,
+                "instructions": [config.instructions, voiceContext].filter { !$0.isEmpty }.joined(separator: "\n\n"),
+                "audio": [
+                    "format": ["type": "audio/pcm", "rate": Int(AudioIO.sampleRate)],
+                    "output": ["voice": config.voice],
+                ],
+                "delegation": ["type": "responses", "responses": responses],
+                "input": history,
+            ] as [String: Any],
+        ]
+    }
+
+    private func send(_ event: [String: Any]) {
+        guard let socket,
+              let data = try? JSONSerialization.data(withJSONObject: event),
+              let text = String(data: data, encoding: .utf8)
+        else { return }
+        socket.send(.string(text)) { error in
+            if let error { Log.debug("send falhou: \(error)") }
+        }
+    }
+
+    private func receive(on socket: URLSessionWebSocketTask) {
+        socket.receive { [weak self] result in
+            Task { @MainActor in
+                guard let self, self.socket === socket else { return }
+                switch result {
+                case .success(let message):
+                    switch message {
+                    case .string(let text): self.handle(text: text)
+                    case .data(let data): self.handle(text: String(decoding: data, as: UTF8.self))
+                    @unknown default: break
+                    }
+                    self.receive(on: socket)
+                case .failure(let error):
+                    if self.state != .idle {
+                        Log.error("websocket encerrado: \(error.localizedDescription)")
+                        self.finish(reason: self.state == .closing ? self.endReason : "connection_lost")
+                    }
+                }
+            }
+        }
+    }
+
+    private func handle(text: String) {
+        guard let data = text.data(using: .utf8),
+              let event = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let type = event["type"] as? String
+        else { return }
+        let now = Self.now
+
+        switch type {
+        case "session.output_audio.delta":
+            guard let b64 = event["delta"] as? String, let pcm = Data(base64Encoded: b64) else { return }
+            audio.play(pcm16: pcm)
+            if AudioIO.peak(pcm16: pcm) > Self.speechPeakThreshold { idle.touch(at: now) }
+            activity?.setOutput(VoiceActivity.level(pcm16: pcm))
+
+        case "session.started":
+            let session = event["session"] as? [String: Any]
+            sessionId = session?["id"] as? String
+            idle = IdleTracker(timeout: idleTimeout, now: now)
+            audioGate.isOpen = true
+            state = .live
+            startIdleTimer()
+            Log.info("sessão ativa \(sessionId ?? "?")")
+            openingCommentary.forEach(appendCommentary)
+            openingCommentary.removeAll()
+
+        case "session.input_transcript.delta":
+            idle.touch(at: now)
+            if let delta = event["delta"] as? String { appendTranscript(.user, delta, now: now) }
+
+        case "session.output_transcript.delta":
+            idle.touch(at: now)
+            if let delta = event["delta"] as? String { appendTranscript(.assistant, delta, now: now) }
+
+        case "session.delegation.created":
+            if let delegation = event["delegation"] as? [String: Any], let id = delegation["id"] as? String {
+                idle.beginWork(id, at: now)
+                activity?.thinking = true
+                Log.info("delegação \(id) → backend")
+            }
+
+        case "response.event":
+            handleBackend(event, now: now)
+
+        case "session.usage.updated":
+            if let usage = event["usage"] as? [String: Any] { Log.debug("uso: \(usage)") }
+
+        case "session.closed":
+            let reason = event["reason"] as? String ?? "closed"
+            let seconds = (event["usage"] as? [String: Any])?["seconds"] ?? "?"
+            Log.info("sessão encerrada (\(reason)), \(seconds)s de voz")
+            finish(reason: state == .closing ? endReason : reason)
+
+        case "error":
+            let error = event["error"] as? [String: Any] ?? [:]
+            Log.error("erro do servidor: \(error["code"] ?? "-") \(error["message"] ?? "")")
+            if state == .connecting { finish(reason: "error: \(error["code"] ?? error["message"] ?? "unknown")") }
+
+        default:
+            Log.debug("evento \(type)")
+        }
+    }
+
+    /// Responses delegation events arrive wrapped: { type: "response.event", delegation_id, event }.
+    private func handleBackend(_ envelope: [String: Any], now: TimeInterval) {
+        guard let delegationId = envelope["delegation_id"] as? String,
+              let inner = envelope["event"] as? [String: Any],
+              let type = inner["type"] as? String
+        else { return }
+        idle.touch(at: now)
+
+        switch type {
+        case "response.output_item.done":
+            guard let item = inner["item"] as? [String: Any],
+                  item["type"] as? String == "function_call",
+                  let callId = item["call_id"] as? String,
+                  let name = item["name"] as? String
+            else { return }
+            let arguments = item["arguments"] as? String ?? "{}"
+            Log.info("tool call \(name)(\(arguments))")
+            let tools = self.tools
+            let task = Task { await tools.call(name: name, argumentsJSON: arguments) }
+            pendingCalls[delegationId, default: []].append((callId, task))
+
+        case "response.output_text.done":
+            if let text = inner["text"] as? String { Log.info("backend → \(RaviText.truncate(text, 300))") }
+
+        case "response.completed", "response.failed", "response.incomplete", "response.cancelled":
+            Log.info("delegação \(delegationId): \(type.replacingOccurrences(of: "response.", with: ""))")
+            guard let calls = pendingCalls.removeValue(forKey: delegationId), !calls.isEmpty else {
+                idle.endWork(delegationId, at: now)
+                activity?.thinking = !idle.pendingWork.isEmpty
+                return
+            }
+            // Return every result for this response, then resume the backend once.
+            Task { @MainActor in
+                for call in calls {
+                    let output = await call.task.value
+                    guard self.state == .live else { return }
+                    self.send([
+                        "type": "response.item.create",
+                        "item": ["type": "function_call_output", "call_id": call.callId, "output": output],
+                    ])
+                }
+                self.send(["type": "response.create"])
+                self.idle.touch(at: Self.now)
+            }
+
+        default:
+            break
+        }
+    }
+
+    private func appendTranscript(_ role: Utterance.Role, _ delta: String, now: TimeInterval) {
+        transcript.append(role, delta, now: now)
+        if let line = transcript.currentText(role) { activity?.setCaption(line, isUser: role == .user) }
+    }
+
+    private func record(_ utterances: [Utterance]) {
+        for utterance in utterances {
+            Log.transcript(utterance.role == .user ? "você" : "ravi", utterance.text)
+            memory?.append(utterance)
+        }
+    }
+
+    // MARK: Idle + teardown
+
+    private func startIdleTimer() {
+        idleTimer?.invalidate()
+        idleTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.tick() }
+        }
+    }
+
+    private func tick() {
+        let now = Self.now
+        record(transcript.flushQuiet(now: now))
+        guard state == .live else { return }
+        if let quiet = closeWhenQuietAfter, idle.pendingWork.isEmpty, now - idle.lastActivity >= quiet {
+            Log.info("pedido enviado e conversa em silêncio; encerrando até a resposta chegar")
+            close(reason: "aguardando resposta")
+        } else if idle.isIdle(at: now) {
+            Log.info("inatividade de \(Int(idleTimeout))s; encerrando")
+            close(reason: "idle")
+        }
+    }
+
+    private func finish(reason: String) {
+        guard state != .idle else { return }
+        idleTimer?.invalidate()
+        closeTimeout?.invalidate()
+        idleTimer = nil
+        closeTimeout = nil
+        audioGate.isOpen = false
+        audio.onCapture = nil
+        audio.flushPlayback()
+        audio.stop()
+        pendingCalls.values.flatMap { $0 }.forEach { $0.task.cancel() }
+        pendingCalls.removeAll()
+        socket?.cancel(with: .normalClosure, reason: nil)
+        socket = nil
+        sessionId = nil
+        record(transcript.flushAll())
+        activity?.reset()
+        state = .idle
+        onEnded?(reason)
+    }
+}
+
+/// Thread-safe flag read from the audio thread.
+final class AudioGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var open = false
+    var isOpen: Bool {
+        get { lock.withLock { open } }
+        set { lock.withLock { open = newValue } }
+    }
+}

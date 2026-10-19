@@ -1,0 +1,98 @@
+{
+  "schema": "ravi.app/v1",
+  "id": "voice",
+  "name": "Ravi Voice",
+  "version": "0.1.0",
+  "description": "Talk to the user out loud on their Mac. `ravi voice say --execute --text \"...\"` publishes on ravi.voice.message; Ravi Voice wakes up and speaks it. Add --reply-to <id> when answering a request that came from Ravi Voice.",
+  "interfaces": {
+    "cli": {
+      "command": "__RAVI_VOICE_BIN__",
+      "json": true
+    }
+  },
+  "context": {
+    "allow": [
+      "read:context:whoami"
+    ]
+  },
+  "operations": {
+    "voice.help": {
+      "interface": "builtin",
+      "handler": "apps.help",
+      "mutating": false
+    },
+    "voice.show": {
+      "interface": "builtin",
+      "handler": "apps.manifest.show",
+      "mutating": false
+    },
+    "voice.say": {
+      "interface": "cli",
+      "command": "__RAVI_VOICE_BIN__ say {args} --json",
+      "mutating": true,
+      "permission": "voice:say"
+    }
+  },
+  "permissions": {
+    "required": [],
+    "optional": [],
+    "mutating": [
+      "voice:say"
+    ]
+  },
+  "operationClasses": {
+    "read": [],
+    "sensitiveRead": [],
+    "write": [
+      "voice.say"
+    ],
+    "destructive": [],
+    "financial": []
+  },
+  "storage": {
+    "sqlite": [],
+    "files": []
+  },
+  "artifacts": [],
+  "events": {
+    "emits": [
+      {
+        "topic": "ravi.voice.message",
+        "when": "an agent sends something for the user to hear (voice say)",
+        "durability": "ephemeral",
+        "schema": "{ appId, correlationId, replyTo?, text, fromSession?, fromAgent?, createdAt }"
+      }
+    ],
+    "consumes": []
+  },
+  "skills": [],
+  "health": {
+    "checks": []
+  },
+  "decisions": {
+    "authentication": {
+      "enabled": false,
+      "reason": "Local-only: publishes to the local Ravi NATS bus; the sender is identified by the caller's own context key."
+    },
+    "storage": {
+      "enabled": false,
+      "reason": "Delivery state lives in the Ravi Voice app (file-drop inbox), not in the app contract."
+    },
+    "events": {
+      "enabled": true,
+      "reason": "The whole point: ravi.voice.message is consumed by a shell trigger that hands it to the Mac app."
+    },
+    "artifacts": {
+      "enabled": false,
+      "reason": "Spoken messages are transient."
+    },
+    "ui": {
+      "enabled": false,
+      "reason": "The UI is the voice itself."
+    }
+  },
+  "versioning": {
+    "compatibility": "semver",
+    "migrations": []
+  }
+}
