@@ -11,6 +11,9 @@ final class AudioIO {
 
     /// Called on the audio thread with exactly `chunkBytes` of PCM16 LE.
     var onCapture: ((Data) -> Void)?
+    /// Optional, thread-safe admission check for a protected observer notification.
+    /// Rechecked at the playback boundary, not only when commentary is submitted.
+    var shouldPlay: (() -> Bool)?
     /// Input device name as shown in System Settings › Sound › Input.
     /// nil = macOS system default. Find exact names in Audio MIDI Setup.app.
     var inputDevice: String?
@@ -153,7 +156,7 @@ final class AudioIO {
     /// Queue PCM16 LE mono 24 kHz for playback.
     func play(pcm16 data: Data) {
         let frames = data.count / 2
-        guard isRunning, frames > 0,
+        guard shouldPlay?() ?? true, isRunning, frames > 0,
               let buffer = AVAudioPCMBuffer(pcmFormat: playFormat, frameCapacity: AVAudioFrameCount(frames))
         else { return }
         buffer.frameLength = AVAudioFrameCount(frames)
@@ -162,6 +165,7 @@ final class AudioIO {
             let samples = raw.bindMemory(to: Int16.self)
             for i in 0..<frames { out[i] = Float(Int16(littleEndian: samples[i])) / 32_768 }
         }
+        guard shouldPlay?() ?? true else { return }
         player.scheduleBuffer(buffer)
     }
 

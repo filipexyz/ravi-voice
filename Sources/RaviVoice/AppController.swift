@@ -17,6 +17,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Announcements for the session being opened (a woken session speaks them first).
     private var pendingOpening: [String] = []
     private var pendingIdleTimeout: TimeInterval?
+    private var pendingObserverAnnouncement = false
+    private var deferredRegularMessages: [VoiceMessage] = []
     private var inbox: VoiceInbox?
     private let memory = ConversationMemory()
     private let activity = VoiceActivity()
@@ -89,25 +91,36 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     /// Opens a conversation. `opening` is said right away (used when a message wakes the voice).
-    private func startSession(opening: [String] = [], idleTimeout: TimeInterval? = nil) {
+    private func startSession(opening: [String] = [], idleTimeout: TimeInterval? = nil,
+                              observerAnnouncement: Bool = false) {
+        if !startingSession { pendingObserverAnnouncement = observerAnnouncement }
         pendingOpening.append(contentsOf: opening)
         if idleTimeout != nil { pendingIdleTimeout = idleTimeout }
         guard let apiKey = config.resolveApiKey() else {
             Log.error("OPENAI_API_KEY não encontrada (config, ambiente ou ~/.ravi/.env)")
             lastEndReason = "sem OPENAI_API_KEY"
             render(.idle)
-            NSSound(named: "Basso")?.play()
+            if !observerAnnouncement { NSSound(named: "Basso")?.play() }
+            pendingOpening.removeAll()
+            pendingObserverAnnouncement = false
             return
         }
         guard !startingSession else { return }
         startingSession = true
         Task {
-            defer { self.startingSession = false }
+            defer {
+                self.startingSession = false
+                if self.session == nil || self.session?.state == .idle {
+                    self.deliverDeferredMessages()
+                }
+            }
             guard await AudioIO.requestMicrophoneAccess() else {
                 Log.error("sem permissão de microfone (Ajustes › Privacidade › Microfone)")
                 self.lastEndReason = "sem permissão de microfone"
                 self.render(.idle)
-                self.sound("Basso")
+                if !self.pendingObserverAnnouncement { self.sound("Basso") }
+                self.pendingOpening.removeAll()
+                self.pendingObserverAnnouncement = false
                 return
             }
             await self.ravi?.prepare()
@@ -134,8 +147,37 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// say it in the live conversation, or wake one up to say it.
     private func handleInbox(_ message: VoiceMessage) {
         Log.transcript("ravi:\(message.fromSession ?? message.fromAgent ?? "?")", message.text)
+        if message.isObserverAnnouncement {
+            // Live does not label output PCM by commentary. Do not mix a background
+            // observer notice into a conversation where it cannot be cancelled alone.
+            guard !startingSession, session == nil || session?.state == .idle else {
+                Log.info("aviso do observer descartado: conversa ocupada")
+                return
+            }
+            let age = Date().timeIntervalSince(message.createdAt) / 60
+            guard config.wakeOnMessages, age >= 0, age < config.wakeMaxAgeMinutes else {
+                Log.info("aviso do observer descartado: despertar indisponível ou aviso antigo")
+                return
+            }
+            // The observer has already produced a short, privacy-filtered utterance.
+            // Do not add session names, request history or another introduction to it.
+            startSession(opening: [message.text], idleTimeout: config.wakeIdleTimeoutSeconds,
+                         observerAnnouncement: true)
+            return
+        }
         let text = ravi?.announcement(for: message)
             ?? "Chegou uma mensagem do Ravi pro usuário. Conte agora, resumindo: \(RaviText.truncate(message.text, 1_400))"
+        // A requested reply takes priority over a background notification.
+        if startingSession && pendingObserverAnnouncement {
+            pendingObserverAnnouncement = false
+            pendingOpening = [text]
+            return
+        }
+        if session?.protectsObserverAnnouncement == true && session?.state != .idle {
+            deferredRegularMessages.append(message)
+            session?.cancelObserverAnnouncement()
+            return
+        }
         if let session, session.announce(text) {
             // Reply to a voice request: re-arm close-when-quiet so the session ends after
             // speaking the response instead of waiting the full idle timeout.
@@ -161,27 +203,30 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func openSession(apiKey: String) {
         audio.inputDevice = config.inputDevice
-        let history = config.memoryEnabled
+        let protectedAnnouncement = pendingObserverAnnouncement
+        let history = config.memoryEnabled && !protectedAnnouncement
             ? memory.historyInput(maxAge: config.memoryHours * 3600, maxTokens: config.memoryMaxTokens)
             : []
         if !history.isEmpty { Log.info("memória: \(history.count - 1) mensagens da conversa anterior no contexto") }
         let session = LiveSession(
             config: config, apiKey: apiKey, tools: tools, audio: audio,
-            voiceContext: ravi?.takeVoiceContext() ?? "",
-            backendContext: ravi?.backendContext() ?? "",
+            voiceContext: protectedAnnouncement ? "" : ravi?.takeVoiceContext() ?? "",
+            backendContext: protectedAnnouncement ? "" : ravi?.backendContext() ?? "",
             openingCommentary: pendingOpening,
             idleTimeout: pendingIdleTimeout,
-            memory: config.memoryEnabled ? memory : nil,
+            memory: config.memoryEnabled && !protectedAnnouncement ? memory : nil,
             history: history,
-            turnEnd: turnEnd
+            turnEnd: protectedAnnouncement ? nil : turnEnd,
+            observerAnnouncement: protectedAnnouncement
         )
         pendingOpening.removeAll()
         pendingIdleTimeout = nil
+        pendingObserverAnnouncement = false
         session.activity = activity
         session.onStateChange = { [weak self] state in
             guard let self else { return }
             self.render(state)
-            if state == .live { self.sound("Pop") }
+            if state == .live && !protectedAnnouncement { self.sound("Pop") }
             if self.config.overlay {
                 state == .idle ? self.overlay.hide() : self.overlay.show()
             }
@@ -191,10 +236,21 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self.lastEndReason = reason
             self.render(.idle)
             self.overlay.hide()
-            self.sound(reason.hasPrefix("error") || reason == "connection_lost" || reason == "audio_error" ? "Basso" : "Blow")
+            if !protectedAnnouncement {
+                self.sound(reason.hasPrefix("error") || reason == "connection_lost" || reason == "audio_error" ? "Basso" : "Blow")
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+                self?.deliverDeferredMessages()
+            }
         }
         self.session = session
         session.start()
+    }
+
+    private func deliverDeferredMessages() {
+        let pending = deferredRegularMessages
+        deferredRegularMessages.removeAll()
+        pending.forEach(handleInbox)
     }
 
     private func sound(_ name: String) {

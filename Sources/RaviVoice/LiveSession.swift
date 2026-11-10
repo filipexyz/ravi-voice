@@ -33,6 +33,8 @@ final class LiveSession {
     private let apiKey: String
     private let tools: ToolRegistry
     private let audio: AudioIO
+    let protectsObserverAnnouncement: Bool
+    private let announcementGate: ObserverAnnouncementGate?
     private let urlSession = URLSession(configuration: .default)
 
     private var socket: URLSessionWebSocketTask?
@@ -82,7 +84,7 @@ final class LiveSession {
          voiceContext: String = "", backendContext: String = "",
          openingCommentary: [String] = [], idleTimeout: TimeInterval? = nil,
          memory: ConversationMemory? = nil, history: [[String: Any]] = [],
-         turnEnd: TurnEndService? = nil) {
+         turnEnd: TurnEndService? = nil, observerAnnouncement: Bool = false) {
         self.config = config
         self.memory = memory
         self.history = history
@@ -95,6 +97,8 @@ final class LiveSession {
         self.apiKey = apiKey
         self.tools = tools
         self.audio = audio
+        self.protectsObserverAnnouncement = observerAnnouncement
+        self.announcementGate = observerAnnouncement ? ObserverAnnouncementGate() : nil
         self.idle = IdleTracker(timeout: idleTimeout ?? config.idleTimeoutSeconds, now: Self.now)
     }
 
@@ -116,14 +120,33 @@ final class LiveSession {
             return
         }
         let gate = audioGate
+        let protection = announcementGate
+        audio.shouldPlay = protection.map { protection in
+            { protection.allowsPlayback(at: ProcessInfo.processInfo.systemUptime) }
+        }
         audio.onCapture = { [weak self] chunk in
-            guard gate.isOpen else { return }
-            let payload = #"{"type":"session.input_audio.append","audio":"\#(chunk.base64EncodedString())"}"#
             let level = VoiceActivity.level(pcm16: chunk)
+            let capturedAt = ProcessInfo.processInfo.systemUptime
+            // Update on the capture thread so already queued main-actor callbacks cannot
+            // submit/play an announcement using a stale quiet observation.
+            let cancelled = protection?.noteInput(level: level, at: capturedAt) ?? false
             Task { @MainActor in
-                self?.socket?.send(.string(payload)) { _ in }
-                self?.activity?.setInput(level)
-                if let self { self.noteInputLevel(level, at: Self.now) }
+                guard let self else { return }
+                self.activity?.setInput(level)
+                if let protection {
+                    if cancelled || protection.isCancelled {
+                        self.finish(reason: "observer_input")
+                    } else {
+                        self.submitObserverAnnouncementIfQuiet()
+                    }
+                    // Notification-only sessions use the mic locally for admission, never
+                    // as conversational input. Human speech cancels this notification.
+                    return
+                }
+                guard gate.isOpen else { return }
+                let payload = #"{"type":"session.input_audio.append","audio":"\#(chunk.base64EncodedString())"}"#
+                self.socket?.send(.string(payload)) { _ in }
+                self.noteInputLevel(level, at: capturedAt)
             }
         }
 
@@ -161,6 +184,11 @@ final class LiveSession {
 
     func setMuted(_ muted: Bool) {
         guard state == .live, muted != isMuted else { return }
+        if protectsObserverAnnouncement {
+            announcementGate?.cancel()
+            finish(reason: "observer_muted")
+            return
+        }
         isMuted = muted
         activity?.muted = muted
         send(["type": muted ? "session.input_audio.mute" : "session.input_audio.unmute", "event_id": muted ? "mute" : "unmute"])
@@ -176,6 +204,7 @@ final class LiveSession {
     /// Say something now (a Ravi reply or message). Queued if the session is still connecting.
     /// Returns false when there is no session to say it.
     func announce(_ text: String) -> Bool {
+        guard !protectsObserverAnnouncement else { return false }
         switch state {
         case .live:
             appendCommentary(text)
@@ -190,6 +219,21 @@ final class LiveSession {
         }
     }
 
+    func cancelObserverAnnouncement() {
+        guard protectsObserverAnnouncement else { return }
+        announcementGate?.cancel()
+        finish(reason: "observer_superseded")
+    }
+
+    private func submitObserverAnnouncementIfQuiet() {
+        guard state == .live, let announcementGate, !openingCommentary.isEmpty,
+              announcementGate.markSubmitted(at: Self.now) else { return }
+        let content = openingCommentary.joined(separator: "\n")
+        openingCommentary.removeAll()
+        appendCommentary(content)
+        idle.touch(at: Self.now)
+    }
+
     /// End the conversation once both sides have been quiet for `seconds` (used after a request
     /// is sent: the voice says "I'll get back to you" and hangs up; the answer reopens it).
     func closeWhenQuiet(after seconds: TimeInterval) {
@@ -200,8 +244,8 @@ final class LiveSession {
     // MARK: Wire
 
     private func sessionStartEvent() -> [String: Any] {
-        var backendTools = tools.definitions
-        if config.webSearch { backendTools.append(["type": "web_search"]) }
+        var backendTools = protectsObserverAnnouncement ? [] : tools.definitions
+        if config.webSearch && !protectsObserverAnnouncement { backendTools.append(["type": "web_search"]) }
         var responses: [String: Any] = [
             "model": config.backendModel,
             "instructions": [config.backendInstructions, backendContext].filter { !$0.isEmpty }.joined(separator: "\n\n"),
@@ -213,7 +257,9 @@ final class LiveSession {
             "event_id": "start",
             "session": [
                 "model": config.model,
-                "instructions": [config.instructions, voiceContext].filter { !$0.isEmpty }.joined(separator: "\n\n"),
+                "instructions": protectsObserverAnnouncement
+                    ? "Esta sessão transmite um único aviso do Ravi. Aguarde em silêncio até receber commentary; então diga somente o aviso em português, sem saudação, pergunta extra ou outras ações."
+                    : [config.instructions, voiceContext].filter { !$0.isEmpty }.joined(separator: "\n\n"),
                 "audio": [
                     "format": ["type": "audio/pcm", "rate": Int(AudioIO.sampleRate)],
                     "output": ["voice": config.voice],
@@ -266,6 +312,10 @@ final class LiveSession {
         switch type {
         case "session.output_audio.delta":
             guard let b64 = event["delta"] as? String, let pcm = Data(base64Encoded: b64) else { return }
+            if let announcementGate, !announcementGate.allowsPlayback(at: now) {
+                if announcementGate.isCancelled { finish(reason: "observer_input_unavailable") }
+                return
+            }
             audio.play(pcm16: pcm)
             if AudioIO.peak(pcm16: pcm) > Self.speechPeakThreshold { idle.touch(at: now) }
             let level = VoiceActivity.level(pcm16: pcm)
@@ -273,6 +323,7 @@ final class LiveSession {
             if level > config.turnEnd.d0.outputThreshold {
                 lastOutputSpeechAt = now
                 candidateArmed = true
+                if protectsObserverAnnouncement { closeWhenQuietAfter = 1.5 }
             }
 
         case "session.started":
@@ -284,18 +335,24 @@ final class LiveSession {
             startIdleTimer()
             startTurnEndTimer()
             Log.info("sessão ativa \(sessionId ?? "?")")
-            openingCommentary.forEach(appendCommentary)
-            openingCommentary.removeAll()
+            if protectsObserverAnnouncement {
+                submitObserverAnnouncementIfQuiet()
+            } else {
+                openingCommentary.forEach(appendCommentary)
+                openingCommentary.removeAll()
+            }
 
         case "session.input_transcript.delta":
             idle.touch(at: now)
             if let delta = event["delta"] as? String { appendTranscript(.user, delta, now: now) }
 
         case "session.output_transcript.delta":
+            if let announcementGate, !announcementGate.allowsPlayback(at: now) { return }
             idle.touch(at: now)
             if let delta = event["delta"] as? String { appendTranscript(.assistant, delta, now: now) }
 
         case "session.delegation.created":
+            guard !protectsObserverAnnouncement else { return }
             if let delegation = event["delegation"] as? [String: Any], let id = delegation["id"] as? String {
                 idle.beginWork(id, at: now)
                 activity?.thinking = true
@@ -326,6 +383,7 @@ final class LiveSession {
 
     /// Responses delegation events arrive wrapped: { type: "response.event", delegation_id, event }.
     private func handleBackend(_ envelope: [String: Any], now: TimeInterval) {
+        guard !protectsObserverAnnouncement else { return }
         guard let delegationId = envelope["delegation_id"] as? String,
               let inner = envelope["event"] as? [String: Any],
               let type = inner["type"] as? String
@@ -405,7 +463,8 @@ final class LiveSession {
 
     private func startIdleTimer() {
         idleTimer?.invalidate()
-        idleTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+        idleTimer = Timer.scheduledTimer(withTimeInterval: protectsObserverAnnouncement ? 0.1 : 1,
+                                        repeats: true) { [weak self] _ in
             Task { @MainActor in self?.tick() }
         }
     }
@@ -521,6 +580,15 @@ final class LiveSession {
 
     private func tick() {
         let now = Self.now
+        if let announcementGate {
+            // Also invalidate already buffered playback if capture stops between output
+            // events. Waiting for another PCM frame would leave that buffer unguarded.
+            _ = announcementGate.allowsPlayback(at: now)
+            if announcementGate.isCancelled {
+                finish(reason: "observer_input_unavailable")
+                return
+            }
+        }
         record(transcript.flushQuiet(now: now))
         guard state == .live else { return }
         if let quiet = closeWhenQuietAfter, idle.pendingWork.isEmpty, now - idle.lastActivity >= quiet {
@@ -545,8 +613,10 @@ final class LiveSession {
         recheckWork = nil
         recheckUntil = 0
         audioGate.isOpen = false
+        announcementGate?.cancel()
         audio.onCapture = nil
         audio.flushPlayback()
+        audio.shouldPlay = nil
         audio.stop()
         pendingCalls.values.flatMap { $0 }.forEach { $0.task.cancel() }
         pendingCalls.removeAll()

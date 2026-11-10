@@ -1,5 +1,30 @@
 # Ravi Voice — handoff
 
+## 2026-11-10 — proteção de avisos do voice-observer (local, sem instalação)
+
+Worktree própria `ravi-voice-observer-attention`, branch `feat/voice-observer-safe-announcements`,
+base remota `e215d8a`. O commit local anterior `a2035e6` (knock detector) foi excluído
+da branch de publicação. O checkout principal e suas alterações de outro trabalho foram
+preservados. Escopo autorizado: impedir que avisos do observer entrem por cima de fala.
+
+- `voice-observer` é identificado por `VoiceMessage.fromAgent`, não pelo texto.
+- Conversa ocupada: descartar aviso sem guardá-lo para ressurgir no contexto.
+- App ocioso: sessão de anúncio isolada, sem chimes/histórico/tools de ação; microfone
+  usado localmente para um segundo de silêncio contínuo antes da submissão.
+- Guard compartilhado entre captura e playback: fala detectada, amostra inválida ou
+  captura interrompida cancela terminalmente; áudio enfileirado é limpo no encerramento.
+- Outros remetentes têm prioridade, cancelando a notificação isolada antes do fluxo normal.
+- Testes focados do gate usam timestamps artificiais, sem microfone nem rede.
+
+Não houve install, restart, alteração de config do Luís ou renovação do experimento.
+Publicação deve usar `ravi pr publish` autenticado quando o runtime atualizado disponibilizar
+o comando; não usar upload manual por Git Data API. A ativação do detector de assuntos
+abandonados e a renovação por prazo ainda dependem da etapa posterior, após instalação
+e validação do caminho real. Ver resultado de testes no registro da PR/commit.
+
+Limite explícito: as garantias são relativas à fala detectada e às amostras da captura;
+há latência de hardware/processamento. Validação acústica no Mac continua pendente.
+
 Atualizado em 2026-10-18 22:00 (BRT), a partir da sessão Claude Code `d0ca769b-f138-4fcc-a8cc-868500614940`
 em `~/.claude/projects/-Users-luis-Dev-filipelabs-ravi-voice/`.
 
