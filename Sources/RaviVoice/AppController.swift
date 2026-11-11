@@ -165,17 +165,18 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
                          observerAnnouncement: true)
             return
         }
-        let text = ravi?.announcement(for: message)
-            ?? "Chegou uma mensagem do Ravi pro usuário. Conte agora, resumindo: \(RaviText.truncate(message.text, 1_400))"
         // A requested reply takes priority over a background notification.
-        if startingSession && pendingObserverAnnouncement {
-            pendingObserverAnnouncement = false
-            pendingOpening = [text]
-            return
-        }
+        // Defer before preparing the text: announcement(for:) consumes replyTo context.
         if session?.protectsObserverAnnouncement == true && session?.state != .idle {
             deferredRegularMessages.append(message)
             session?.cancelObserverAnnouncement()
+            return
+        }
+        let text = ravi?.announcement(for: message)
+            ?? "Chegou uma mensagem do Ravi pro usuário. Conte agora, resumindo: \(RaviText.truncate(message.text, 1_400))"
+        if startingSession && pendingObserverAnnouncement {
+            pendingObserverAnnouncement = false
+            pendingOpening = [text]
             return
         }
         if let session, session.announce(text) {

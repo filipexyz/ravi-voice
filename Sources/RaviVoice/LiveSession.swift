@@ -122,14 +122,14 @@ final class LiveSession {
         let gate = audioGate
         let protection = announcementGate
         audio.shouldPlay = protection.map { protection in
-            { protection.allowsPlayback(at: ProcessInfo.processInfo.systemUptime) }
+            { protection.allowsPlayback() }
         }
         audio.onCapture = { [weak self] chunk in
             let level = VoiceActivity.level(pcm16: chunk)
             let capturedAt = ProcessInfo.processInfo.systemUptime
             // Update on the capture thread so already queued main-actor callbacks cannot
             // submit/play an announcement using a stale quiet observation.
-            let cancelled = protection?.noteInput(level: level, at: capturedAt) ?? false
+            let cancelled = protection?.noteInput(level: level) ?? false
             Task { @MainActor in
                 guard let self else { return }
                 self.activity?.setInput(level)
@@ -227,7 +227,7 @@ final class LiveSession {
 
     private func submitObserverAnnouncementIfQuiet() {
         guard state == .live, let announcementGate, !openingCommentary.isEmpty,
-              announcementGate.markSubmitted(at: Self.now) else { return }
+              announcementGate.markSubmitted() else { return }
         let content = openingCommentary.joined(separator: "\n")
         openingCommentary.removeAll()
         appendCommentary(content)
@@ -312,7 +312,7 @@ final class LiveSession {
         switch type {
         case "session.output_audio.delta":
             guard let b64 = event["delta"] as? String, let pcm = Data(base64Encoded: b64) else { return }
-            if let announcementGate, !announcementGate.allowsPlayback(at: now) {
+            if let announcementGate, !announcementGate.allowsPlayback() {
                 if announcementGate.isCancelled { finish(reason: "observer_input_unavailable") }
                 return
             }
@@ -347,7 +347,7 @@ final class LiveSession {
             if let delta = event["delta"] as? String { appendTranscript(.user, delta, now: now) }
 
         case "session.output_transcript.delta":
-            if let announcementGate, !announcementGate.allowsPlayback(at: now) { return }
+            if let announcementGate, !announcementGate.allowsPlayback() { return }
             idle.touch(at: now)
             if let delta = event["delta"] as? String { appendTranscript(.assistant, delta, now: now) }
 
@@ -583,7 +583,7 @@ final class LiveSession {
         if let announcementGate {
             // Also invalidate already buffered playback if capture stops between output
             // events. Waiting for another PCM frame would leave that buffer unguarded.
-            _ = announcementGate.allowsPlayback(at: now)
+            _ = announcementGate.allowsPlayback()
             if announcementGate.isCancelled {
                 finish(reason: "observer_input_unavailable")
                 return

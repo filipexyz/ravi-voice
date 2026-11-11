@@ -28,8 +28,10 @@ final class ObserverAnnouncementGate: @unchecked Sendable {
 
     /// Returns true when the caller must abandon the announcement and flush playback.
     @discardableResult
-    func noteInput(level: Double, at now: TimeInterval) -> Bool {
+    func noteInput(level: Double,
+                   at timestamp: @autoclosure () -> TimeInterval = ProcessInfo.processInfo.systemUptime) -> Bool {
         lock.withLock {
+            let now = timestamp()
             guard !cancelled else { return true }
             guard level.isFinite, now.isFinite, level >= 0, level < inputThreshold else {
                 cancelled = true
@@ -57,24 +59,26 @@ final class ObserverAnnouncementGate: @unchecked Sendable {
         }
     }
 
-    func canSubmit(at now: TimeInterval) -> Bool {
-        lock.withLock { readyToSubmit(at: now) }
+    // Sample the monotonic clock only after acquiring the lock. A newer capture must
+    // not make a playback check look regressive while that check waits for the lock.
+    func canSubmit(at timestamp: @autoclosure () -> TimeInterval = ProcessInfo.processInfo.systemUptime) -> Bool {
+        lock.withLock { readyToSubmit(at: timestamp()) }
     }
 
     /// Combines the last input check and one-time admission under the audio callback's lock.
     @discardableResult
-    func markSubmitted(at now: TimeInterval) -> Bool {
+    func markSubmitted(at timestamp: @autoclosure () -> TimeInterval = ProcessInfo.processInfo.systemUptime) -> Bool {
         lock.withLock {
-            guard readyToSubmit(at: now) else { return false }
+            guard readyToSubmit(at: timestamp()) else { return false }
             submitted = true
             return true
         }
     }
 
-    func allowsPlayback(at now: TimeInterval) -> Bool {
+    func allowsPlayback(at timestamp: @autoclosure () -> TimeInterval = ProcessInfo.processInfo.systemUptime) -> Bool {
         lock.withLock {
             guard !cancelled, submitted else { return false }
-            guard freshInput(at: now) else {
+            guard freshInput(at: timestamp()) else {
                 cancelled = true
                 return false
             }

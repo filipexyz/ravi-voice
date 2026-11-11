@@ -143,4 +143,18 @@ final class ObserverAnnouncementGateTests: XCTestCase {
         XCTAssertEqual(admitted, 1)
         XCTAssertTrue(gate.allowsPlayback(at: 1))
     }
+
+    func testConcurrentQuietCaptureAndPlaybackKeepAnnouncementAdmitted() {
+        let gate = ObserverAnnouncementGate(quietSeconds: .leastNormalMagnitude,
+                                            sampleFreshness: 10)
+        XCTAssertFalse(gate.noteInput(level: 0))
+        XCTAssertTrue(gate.markSubmitted())
+        DispatchQueue.concurrentPerform(iterations: 16) { _ in
+            for _ in 0..<100 {
+                XCTAssertFalse(gate.noteInput(level: 0))
+                XCTAssertTrue(gate.allowsPlayback())
+            }
+        }
+        XCTAssertFalse(gate.isCancelled)
+    }
 }
