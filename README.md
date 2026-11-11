@@ -113,6 +113,32 @@ app no Mac: conversa aberta → fala na hora; fechada → acorda (som), fala e f
   `RaviVoice say` espaça as publicações em 1,2s pra nenhuma cair nele.
 - Instalar/remover o lado do Ravi (app + trigger): `scripts/ravi-setup.sh` / `scripts/ravi-setup.sh remove`.
 
+### Avisos do observer sem competir com a conversa
+
+Mensagens autenticadas com `fromAgent: voice-observer` usam um caminho de notificação
+isolado. Se já há conversa aberta ou abrindo, são descartadas, sem entrar no contexto para
+serem repetidas depois. Quando podem despertar o app, não tocam chimes e aguardam um
+segundo de captura local continuamente quieta e recente antes de enviar o aviso ao Live.
+Essa sessão não envia a captura humana à rede nem carrega histórico de conversas.
+
+O gate permanece na borda do playback: fala detectada, captura interrompida/antiga ou
+microfone mutado cancelam a notificação e limpam o áudio pendente; o aviso não é retomado.
+Mensagens comuns têm prioridade e cancelam uma notificação protegida antes de seguir
+seu fluxo. A proteção prefere perder um aviso a interromper. O limite físico
+continua sendo a detecção local (limiar e latência da captura), não uma promessa de
+detectar qualquer fala humana instantaneamente.
+
+Validação focada: `swift test --jobs 2 --filter ObserverAnnouncementGateTests`.
+O prazo do experimento `voice-observer` continua no gate do Ravi e não é renovado pelo app.
+
+O bundle `ravi/observers/voice-attention` contém o profile v2 para detectar assunto importante
+abandonado: pendência concreta, mudança de assunto, duas trocas completas sem retomada e
+fechamento explícito do bloco. Retomada, resolução, adiamento consciente ou aviso anterior
+suprimem o candidato. Somente os templates de delivery são executados; o corpo de `PROFILE.md`
+é documentação. O bundle permanece **sem ativação automática**: instalar e validar primeiro
+o consumidor protegido, obter a decisão sobre renovação do experimento e só então copiar
+para o profile local e renovar seus snapshots, sem alterar outros profiles/bindings.
+
 ### Fim de turno — D0 + Jev (nativo)
 
 O app calcula um gate acústico local (**D0**: nível de saída baixo por 300 ms, sem fala do

@@ -14,6 +14,9 @@ struct VoiceMessage: Codable, Equatable, Sendable {
     var fromAgent: String?
     var createdAt: Date
 
+    /// The sender is populated by the authenticated `say` caller, not inferred from text.
+    var isObserverAnnouncement: Bool { fromAgent == "voice-observer" }
+
     /// Trigger data files hold the event payload; tolerate a `{ data: … }` envelope too.
     static func decode(_ data: Data) throws -> VoiceMessage {
         let decoder = JSONDecoder()
